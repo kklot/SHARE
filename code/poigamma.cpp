@@ -26,17 +26,10 @@ Type objective_function<Type>::operator()()
 
   PARAMETER_VECTOR(gamma);
   dll -= dgamma(gamma, alpha, Type(1) / alpha, true).sum(); // mean = 1
-  
-  // AR2
-  DATA_SPARSE_MATRIX(A);
-  PARAMETER_VECTOR(pacf_vec);
-  PARAMETER_VECTOR(yob);
-  dll += ktools::AR2(yob, pacf_vec);
 
   // Store for criteria
   vector<Type> eta = X * betas;
-  vector<Type> re = A * yob;
-  vector<Type> lambda = gamma * E * exp(eta + re);
+  vector<Type> lambda = gamma * E * exp(eta);
   
   // Data likelihood
   vector<Type> ll(y.size());
@@ -55,13 +48,16 @@ Type objective_function<Type>::operator()()
         ll[i] = log(1 - ppois(Type(0), lambda[i]));
       else if (y[i] == 98)
         ll[i] = log(1 - ppois(Type(98), lambda[i]) + DBL_EPSILON);
+      else if (y[i] >= 365)
+        ll[i] = log(1 - ppois(Type(365), lambda[i]) + DBL_EPSILON);
     }
   }
 
   dll -= ll.sum();
 
   REPORT(ll);
-  REPORT(betas);
+  vector<Type> rr = exp(betas);
+  REPORT(rr);
   REPORT(alpha);
   REPORT(gamma);
   REPORT(lambda);
