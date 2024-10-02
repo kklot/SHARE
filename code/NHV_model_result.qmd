@@ -1,0 +1,646 @@
+---
+title: SHARE model output
+author: Kính
+execute:
+  warning: false
+  echo: false
+output:
+  html_document:
+    embed-resources: true
+    anchor-sections: true
+    smooth-scroll: true
+always_allow_html: true
+editor:
+  render-on-save: true
+toc: true
+toc_float: true
+toc_location: right
+theme: cosmo
+fontsize: 1em
+linestretch: 1.2
+number-sections: true
+comments:
+  hypothesis:
+    theme: clean
+code-fold: false
+fig-width: 7
+fig-height: 4
+---
+
+```{r}
+#| include: false
+sessionInfo()
+```
+
+```{r}
+#| include: false
+library(dplyr)
+library(tidyr)
+
+# inla requirements
+# install.packages('sn')
+# install.packages('sp')
+# install.packages('fmesher')
+# install.packages('/home/fuchs/fias/knguyen/INLA_24.06.27.tar.gz', repos = NULL, type="source")
+library(INLA)
+library(knitr)
+devtools::load_all('~/Code/R/ktools/') # remotes::install_github('kklot/ktools')
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(countrycode)
+library(stringr)
+options(
+    ggplot2.discrete.colour=ktools:::okabe,
+    ggplot2.discrete.fill=ktools:::okabe
+)
+```
+
+## Sanity checks
+
+Read fit and sampling
+
+```{r}
+md.female = readRDS(here('fitted/md.female.free.update2.rds'))
+md.male = readRDS(here('fitted/md.male.free.update2.rds'))
+```
+
+```{r}
+sp.male <- inla.posterior.sample(100, md.male)
+sp.female <- inla.posterior.sample(100, md.female)
+```
+
+## Meta data
+
+Countries
+
+```{r}
+c_meta = read.csv(here('data/c_meta.csv'))
+c_meta
+```
+
+health conditions labels
+
+```{r}
+phd_lb <- c(
+    ph006d1  = "Heart attack",
+    ph006d2  = "Hypertension",
+    ph006d3  = "High cholesterol",
+    ph006d4  = "Stroke",
+    ph006d5  = "Diabetes",
+    ph006d6  = "Chronic lung disease",
+    ph006d10 = "Cancer",
+    ph006d11 = "Stomach, duodenal, peptic ulcer",
+    ph006d12 = "Parkinson",
+    ph006d13 = "Cataracts",
+    ph006d14 = "Hip, femoral fracture"
+)
+phd_lb
+```
+## Countries mean trends
+
+```{r}
+(yearx <- md.male$.args$data$year %>% max %>% seq(1, .))
+(ccx <- c_meta$cid)
+
+trend.male <- inla.posterior.sample.eval(
+    function(yearv, cc) {
+        o <- NULL
+        for (c in cc) 
+            for (y in yearv) 
+                o <- c(o, i0[c] + cid1[c] * yearv[y])
+        return(log(12) * exp(o))
+    },
+    sp.male,
+    yearv = yearx, # 2020
+    cc = ccx
+)
+
+trend.female <- inla.posterior.sample.eval(
+    function(yearv, cc) {
+        o <- NULL
+        for (c in cc) 
+            for (y in yearv) 
+                o <- c(o, i0[c] + cid1[c] * yearv[y])
+        return(log(12) * exp(o))
+    },
+    sp.female,
+    yearv = yearx, # 2020
+    cc = ccx
+)
+
+# get CI
+
+trend.male <- trend.male %>% 
+    as_tibble %>% 
+    rename_with(~paste0('V', 1:length(sp.male))) %>% 
+    mutate(
+        year = rep(yearx, times = length(ccx)), 
+        cid = rep(ccx, each = length(yearx))
+    ) %>% 
+    drop_na() %>% 
+    rowwise() %>% 
+    transmute(
+        year, cid,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'male'
+    )
+
+trend.female <- trend.female %>% 
+    as_tibble %>% 
+    mutate(
+        year = rep(yearx, times = length(ccx)), 
+        cid = rep(ccx, each = length(yearx))
+    ) %>% 
+    drop_na() %>% 
+    rowwise() %>% 
+    transmute(
+        year,cid ,
+        lo = quantile(c_across(starts_with('sample:')), probs = .025),
+        me = quantile(c_across(starts_with('sample:')), probs = .5),
+        up = quantile(c_across(starts_with('sample:')), probs = .975),
+        sex = 'female'
+    )
+```
+
+## Trends data
+
+```{r}
+# remove on data years
+cid.year.min  <- tibble(
+    cid = md.male$.args$data$cid1,
+    year = md.male$.args$data$year,
+    Y = md.male$.args$data$Y[, 1],
+    ) %>% 
+    drop_na() %>% 
+    distinct() %>% 
+    arrange(cid, year) %>% 
+    group_by(cid) %>% 
+    summarise(
+        min = min(year),
+        # max = max(year)
+    )
+
+trend.data <- trend.male %>% 
+    bind_rows(trend.female) %>% 
+    left_join(c_meta, 'cid') %>%
+    left_join(cid.year.min, 'cid') %>%
+    filter(year >= min) %>% 
+    mutate(
+        year = year + 2003, 
+        lab = if_else(year == 2019 | year == min + 2003, round(me, 1), NA_real_), 
+        ylab = if_else(sex == 'male', lab - 0.5, lab + 0.5)
+    )
+```
+
+## Trend plot
+
+```{r}
+trend.data %>% 
+    filter(year < 2020) %>% 
+    ggplot(aes(year, me, ymin = lo, ymax = up)) +
+    geom_ribbon(aes(fill = sex), alpha = .5) +
+    geom_line(aes(color = sex)) +
+    geom_text(aes(y = ylab, label = lab, color = sex), 
+        show.legend = F, size = 2.5, vjust = "inward", hjust = "inward") +
+    facet_wrap(~country) +
+    labs(x = 'Year', y = 'Annual number of health visits') +
+    theme_light() +
+    scale_fill_manual(values = unname(okcol[c('yellow', 'blue')])) +
+    scale_color_manual(values = unname(okcol[c('yellow', 'blue')])) +
+    theme(
+        panel.background = element_rect(fill = okcol['base3']),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_rect("white"),
+        strip.text = element_text(color = "grey20", hjust = 0, face = "bold"),
+        legend.position = c(.9, .0),
+        legend.direction = "horizontal"
+    )
+ggsave(here('fig/trend.number.pdf'), width = 9, height = 8, dpi = 300)
+```
+
+## Country mean- geo plot
+
+```{r}
+malta <- sf::st_read(here('data/Malta_shapefile/mt_10km.shp')) %>% 
+    st_geometry() %>% 
+    st_union() %>% 
+    st_as_sf() %>% 
+    rename(geometry = x, x = NULL) %>% 
+    mutate(country = "Malta") %>% 
+    st_transform(4326) %>%
+    st_buffer(dist = -0.5)
+
+country.sf <- 
+    ne_countries(
+        geounit = c_meta$country, 
+        type = "map_units", returnclass = 'sf') |>
+    filter(admin != 'Czechia') %>% 
+    bind_rows(
+        ne_countries(country = "Czechia", returnclass = 'sf')
+    ) %>% 
+    select(country = admin) %>% 
+    bind_rows(malta) %>% 
+    mutate(
+        iso = countrycode(country, 'country.name', 'iso3c')
+    ) |> 
+    left_join(c_meta, c('iso', 'country'))  |> 
+    arrange(cid)
+```
+
+```{r}
+map.mf <- trend.data %>% 
+    filter(year == 2019) %>%
+    left_join(country.sf, c('iso', 'country', 'cid')) %>% 
+ggplot() +
+    geom_sf(aes(fill = me, geometry = geometry), color = okcol['base2']) +
+    facet_wrap(~sex) +
+    ggrepel::geom_text_repel(
+        aes(label = country, geometry = geometry),
+        min.segment.length = 1,
+        size = 3,
+        stat = "sf_coordinates",
+        color = "white", # text color
+        bg.color = "grey30", # shadow color
+        bg.r = 0.15
+    ) +
+    scale_fill_viridis_c(direction = 1) +
+    facet_wrap(~sex, labeller = as_labeller(toupper)) +
+    theme_void() +
+    labs(fill = "Annual rate (2019)") +
+    theme(
+        strip.text = element_text(face = 'bold', hjust = 0),
+        panel.background = element_rect(fill = okcol['base3'], color = 'white'),
+        legend.key.height = unit(.21, 'cm'), legend.position = 'bottom', legend.title = element_text(vjust = 1.1))
+
+ggsave(here('fig/map.mf.jpg'), width = 9, height = 6, dpi = 300)
+system(paste('pdfcrop', here('fig/map.mf.pdf')))
+```
+
+
+## Diseases
+
+Since there is interaction, we need to sample to get the interaction effect, i.e., for cancer,
+$$(\beta_{cancer} + \beta_{cancer\ and\ epidemic}) cancer$$
+
+```{r}
+disease.male <- inla.posterior.sample.eval(
+    function() {
+        did = 8
+        c(
+        d1_pre = exp(d1_0),
+        d1_epi = exp(d1_0 * theta[did + 1]),
+        d1_pos = exp(d1_0 * theta[did + 2]),
+        d2_pre = exp(d2_0),
+        d2_epi = exp(d2_0 * theta[did + 3]),
+        d2_pos = exp(d2_0 * theta[did + 4]),
+        d3_pre = exp(d3_0),
+        d3_epi = exp(d3_0 * theta[did + 5]),
+        d3_pos = exp(d3_0 * theta[did + 6]),
+        d4_pre = exp(d4_0),
+        d4_epi = exp(d4_0 * theta[did + 7]),
+        d4_pos = exp(d4_0 * theta[did + 8]),
+        d5_pre = exp(d5_0),
+        d5_epi = exp(d5_0 * theta[did + 9]),
+        d5_pos = exp(d5_0 * theta[did + 10]),
+        d6_pre = exp(d6_0),
+        d6_epi = exp(d6_0 * theta[did + 11]),
+        d6_pos = exp(d6_0 * theta[did + 12]),
+        d10_pre = exp(d10_0),
+        d10_epi = exp(d10_0 * theta[did + 13]),
+        d10_pos = exp(d10_0 * theta[did + 14]),
+        d11_pre = exp(d11_0),
+        d11_epi = exp(d11_0 * theta[did + 15]),
+        d11_pos = exp(d11_0 * theta[did + 16]),
+        d12_pre = exp(d12_0),
+        d12_epi = exp(d12_0 * theta[did + 17]),
+        d12_pos = exp(d12_0 * theta[did + 18]),
+        d13_pre = exp(d13_0),
+        d13_epi = exp(d13_0 * theta[did + 19]),
+        d13_pos = exp(d13_0 * theta[did + 20]),
+        d14_pre = exp(d14_0),
+        d14_epi = exp(d14_0 * theta[did + 21]),
+        d14_pos = exp(d14_0 * theta[did + 22])
+        )
+    },
+    sp.male
+)
+
+disease.female <- inla.posterior.sample.eval(
+    function() {
+        did = 8
+        c(
+        d1_pre = exp(d1_0),
+        d1_epi = exp(d1_0 * theta[did + 1]),
+        d1_pos = exp(d1_0 * theta[did + 2]),
+        d2_pre = exp(d2_0),
+        d2_epi = exp(d2_0 * theta[did + 3]),
+        d2_pos = exp(d2_0 * theta[did + 4]),
+        d3_pre = exp(d3_0),
+        d3_epi = exp(d3_0 * theta[did + 5]),
+        d3_pos = exp(d3_0 * theta[did + 6]),
+        d4_pre = exp(d4_0),
+        d4_epi = exp(d4_0 * theta[did + 7]),
+        d4_pos = exp(d4_0 * theta[did + 8]),
+        d5_pre = exp(d5_0),
+        d5_epi = exp(d5_0 * theta[did + 9]),
+        d5_pos = exp(d5_0 * theta[did + 10]),
+        d6_pre = exp(d6_0),
+        d6_epi = exp(d6_0 * theta[did + 11]),
+        d6_pos = exp(d6_0 * theta[did + 12]),
+        d10_pre = exp(d10_0),
+        d10_epi = exp(d10_0 * theta[did + 13]),
+        d10_pos = exp(d10_0 * theta[did + 14]),
+        d11_pre = exp(d11_0),
+        d11_epi = exp(d11_0 * theta[did + 15]),
+        d11_pos = exp(d11_0 * theta[did + 16]),
+        d12_pre = exp(d12_0),
+        d12_epi = exp(d12_0 * theta[did + 17]),
+        d12_pos = exp(d12_0 * theta[did + 18]),
+        d13_pre = exp(d13_0),
+        d13_epi = exp(d13_0 * theta[did + 19]),
+        d13_pos = exp(d13_0 * theta[did + 20]),
+        d14_pre = exp(d14_0),
+        d14_epi = exp(d14_0 * theta[did + 21]),
+        d14_pos = exp(d14_0 * theta[did + 22])
+        )
+    },
+    sp.female
+)
+
+disease.male <- 
+disease.male %>%
+    as.data.frame %>% 
+    tibble::rownames_to_column() %>% 
+    rename_with(~c("name", paste0('V', 1:length(sp.male)))) %>% 
+    rowwise() %>% 
+    transmute(
+        name,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'male'
+    )
+
+disease.female <- 
+disease.female %>%
+    as.data.frame %>% 
+    tibble::rownames_to_column() %>% 
+    rename_with(~c("name", paste0('V', 1:length(sp.female)))) %>% 
+    rowwise() %>% 
+    transmute(
+        name,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'female'
+    )
+
+disease.data <- disease.male %>% bind_rows(disease.female) 
+```
+
+## Age effect
+
+```{r}
+age.male <- inla.posterior.sample.eval(function() exp(age1), sp.male)
+age.female <- inla.posterior.sample.eval(function() exp(age1), sp.female)
+
+age.male <- age.male %>%
+    as.data.frame %>% 
+    tibble::rownames_to_column() %>% 
+    rename_with(~c("name", paste0('V', 1:length(sp.male)))) %>% 
+    rowwise() %>% 
+    transmute(
+        name,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'male'
+    )
+
+age.female <- age.female %>%
+    as.data.frame %>% 
+    tibble::rownames_to_column() %>% 
+    rename_with(~c("name", paste0('V', 1:length(sp.female)))) %>% 
+    rowwise() %>% 
+    transmute(
+        name,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'female'
+    )
+
+n.age.id <- md.male$summary.random$age1$ID  %>% length()
+
+age.data <- 
+age.male %>% 
+    bind_rows(age.female) %>% 
+    bind_cols(
+        age.id = rep(md.male$summary.random$age1$ID, 2), 
+        period.id = rep(rep(1:3, each = n.age.id/3), 2), 
+    ) %>% 
+    mutate(
+        age = age.id + 49, 
+        period = c("Pre-", "Epi-", "Post-")[period.id], 
+        period = factor(period, c("Pre-", "Epi-", "Post-"), c("Pre-", "Epi-", "Post-"))
+        )
+```
+
+## Plot age and diseases
+
+```{r}
+g.disese <- 
+    disease.data %>% 
+    mutate(
+        disease = str_extract(name, "(^d[0-9]{1,2})_(.*)", 1),
+        disease = paste0('ph006', disease),
+        period = str_extract(name, "(^d[0-9]{1,2})_(.*)", 2), 
+        period = factor(period, c('pre', 'epi', 'pos'), c('Pre-', 'Epi-', 'Post-')), 
+        strip = "Diseases/Conditions"
+        ) %>%
+    ggplot(aes(reorder(disease, me), me, ymin = lo, ymax = up)) +
+    geom_hline(yintercept = 1, color = "grey60", linetype = "dotted") +
+    geom_pointrange(aes(color = period, shape = sex), position = position_dodge(width = .85), linewidth = .41, lineend = "round", alpha = 1) +
+    scale_x_discrete(labels = function(x) stringr::str_wrap(phd_lb[x], width = 15)) +
+    labs(x = "", y = "Relative change (compared to not having the condition)") +
+    scale_shape_manual(values = c(21, 22), ) +
+    facet_wrap(~strip, labeller = as_labeller(toupper)) +
+    theme_light() +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(linewidth = 14, color = okcol['base3']),
+        strip.text = element_text(color = "grey20", hjust = 0, face = "bold"),
+        strip.background = element_rect("white"),
+        legend.position = c(.9, .22),
+        legend.text = element_text(size = 9), 
+        legend.title = element_text(size = 9)
+    ) +
+    coord_flip()
+
+g.age <- age.data %>% 
+ggplot(aes(age, me, ymin = lo, ymax = up)) +
+    geom_hline(yintercept = 1, linetype = 'dotted', color = 'grey20') +
+    geom_ribbon(aes(fill = period, ), alpha = .6) +
+    facet_wrap(~sex, nrow = 2, labeller = as_labeller(toupper)) +
+    geom_line(aes(color = period)) +
+    labs(x = "Age", y = "Relative change") +
+    coord_cartesian(expand = F) +
+    theme_light() +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_rect("white"),
+        panel.background = element_rect(okcol['base3']),
+        strip.text = element_text(color = "grey20", hjust = 0, face = "bold"),
+        axis.text.x = element_text(angle = 90),
+        legend.position = c(.5, .04),
+        legend.text = element_text(size = 9), 
+        legend.title = element_text(size = 9),
+        legend.direction = 'horizontal'
+    )
+
+gg <- g.disese + g.age + plot_layout(widths = c(.6, .4))
+ggsave(here('fig/age.disease.pdf'), width = 9, height = 6, dpi = 300)
+```
+
+
+## Epidemics and post epidemic effect
+
+```{r}
+epi.male <- inla.posterior.sample.eval(function() c(epi_ = exp(epi), post_ = exp(post)), sp.male)
+epi.female <- inla.posterior.sample.eval(function() c(epi_ = exp(epi), post_ = exp(post)), sp.female)
+
+epi.male <- epi.male %>%
+    as.data.frame %>% 
+    tibble::rownames_to_column() %>% 
+    rename_with(~c("name", paste0('V', 1:length(sp.male)))) %>% 
+    rowwise() %>% 
+    transmute(
+        name,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'male'
+    )
+
+epi.female <- epi.female %>%
+    as.data.frame %>% 
+    tibble::rownames_to_column() %>% 
+    rename_with(~c("name", paste0('V', 1:length(sp.female)))) %>% 
+    rowwise() %>% 
+    transmute(
+        name,
+        lo = quantile(c_across(starts_with('V')), probs = .025),
+        me = quantile(c_across(starts_with('V')), probs = .5),
+        up = quantile(c_across(starts_with('V')), probs = .975),
+        sex = 'female'
+    )
+
+epi.data <- 
+epi.male %>% 
+    bind_rows(epi.female) %>% 
+    mutate(
+        period = str_extract(name, '(.*)_(.*)', 1),
+        cid = str_extract(name, '(.*)_(.*)', 2) %>% as.numeric
+    ) %>% 
+    left_join(c_meta, 'cid') %>% 
+    mutate(
+        period = factor(period, c("epi", "post"), c("Epidemic", "Post-Epidemic"))
+        )
+
+eco.group <- bind_rows(
+    tibble(group = 'AX', country = char(Luxembourg, Denmark, Sweden, Netherlands, Austria, Finland, Belgium, Germany, France, Italy, Cyprus, Spain)),
+    tibble(group = 'AY', country = char(Ireland, Malta, Slovenia, Czechia)),
+    tibble(group = 'BX', country = char(Portugal, Greece, Slovakia)),
+    tibble(group = 'BY', country = char(Estonia, Lithuania, Latvia, Hungary)),
+    tibble(group = 'CY', country = char(Croatia, Poland, Romania, Bulgaria))
+)
+
+clas.group <- read.csv(here('data/Selected_classification.csv')) %>% 
+    mutate(iso = countrycode(country, 'country.name', 'iso3c')) %>% 
+    rename_with(~char(country, group, iso))
+
+epi.data <- epi.data %>% left_join(eco.group)
+
+plot.order <- epi.data %>% filter(period == 'Epidemic') %>% 
+    group_by(iso) %>% 
+    summarise(me = mean(me)) %>% 
+    mutate(rank = rank(me), me = NULL)
+
+```
+
+### Plot epi post
+
+```{r}
+g.epi <- epi.data %>% 
+    left_join(plot.order, 'iso') %>% 
+ggplot(aes(reorder(country, rank), me, ymin = lo, ymax = up)) +
+    geom_pointrange(aes(color = sex), position = position_dodge(width = .7), alpha = .6) +
+    facet_grid(vars(group), vars(period), labeller = as_labeller(toupper), scales = 'free', space = 'free_y') +
+    labs(x = "", y = "Relative change") +
+    theme_light() +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(linewidth = 6, color = okcol['base3']),
+        strip.background = element_rect("white"),
+        strip.text = element_text(color = "grey20", hjust = 0, face = "bold"),
+        axis.text.x = element_text(angle = 90),
+        legend.position = c(.92, .93),
+        legend.text = element_text(size = 9), 
+        legend.title = element_text(size = 9),
+    ) +
+    coord_flip()
+ggsave(here('fig/epi.post.pdf'), width = 7, height=7, dpi = 300)
+```
+
+## Table
+
+```{r}
+library(knitr)
+library(kableExtra)
+library(clipr)
+
+trend.data %>% 
+    select(year, country, sex, `0.025quant` = lo, median = me, `0.975quant` = up) %>% 
+    knitr::kable('latex', caption = 'Estimate NHV by country and sex from 2004-2019', booktabs = TRUE, longtable = T) %>% 
+    kable_styling(latex_options = c("repeat_header"),
+              repeat_header_continued = "\\textit{(Continued on Next Page...)}") %>% 
+    writeLines('fitted/trend.data.tex')
+
+epi.data %>% 
+    select(country, sex, period, `0.025quant` = lo, median = me, `0.975quant` = up) %>% 
+    knitr::kable('latex', caption = 'Estimate NHV by epidemic period', booktabs = TRUE, longtable = T) %>% 
+    kable_styling(latex_options = c("repeat_header"),
+              repeat_header_continued = "\\textit{(Continued on Next Page...)}") %>% 
+    writeLines('fitted/epi.data.tex')
+
+disease.data %>% 
+    mutate(
+        disease = str_extract(name, "(^d[0-9]{1,2})_(.*)", 1),
+        disease = paste0('ph006', disease),
+        period = str_extract(name, "(^d[0-9]{1,2})_(.*)", 2), 
+        period = factor(period, c('pre', 'epi', 'pos'), c('Pre-', 'Epi-', 'Post-')), 
+        ) %>% 
+    select(disease, sex, period, `0.025quant` = lo, median = me, `0.975quant` = up) %>% 
+    left_join(
+        tibble(disease = names(phd_lb), text = phd_lb)
+    ) %>% 
+    mutate(disease = text, text = NULL) %>% 
+    knitr::kable('latex', caption = 'Estimate relative change by diseases and epidemic period', booktabs = TRUE, longtable = T) %>% 
+    kable_styling(latex_options = c("repeat_header"),
+              repeat_header_continued = "\\textit{(Continued on Next Page...)}") %>% 
+    writeLines('fitted/disease.data.tex')
+
+age.data %>% 
+    select(age, sex, period, `0.025quant` = lo, median = me, `0.975quant` = up) %>% 
+    knitr::kable('latex', caption = 'Estimate relative change by age and epidemic period', booktabs = TRUE, longtable = T) %>% 
+    kable_styling(latex_options = c("repeat_header"),
+              repeat_header_continued = "\\textit{(Continued on Next Page...)}") %>% 
+    writeLines('fitted/age.data.tex')
+```
